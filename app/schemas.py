@@ -41,6 +41,13 @@ class BatchVoidIn(BaseModel):
     reason: str = Field(..., description="作废原因（必填，不允许空白）；作废保留登记与历史可查，批次号不可复用")
 
 
+class BatchReassignIn(BaseModel):
+    target_line_id: str = Field(
+        ...,
+        description="更正归属的目标产线编号（必须为已登记产线，且与批次当前产线不同）",
+    )
+
+
 class VerificationIn(BaseModel):
     verification_no: str = Field(..., description="出货核验单号（唯一）")
     batch_nos: list[str] = Field(..., min_length=1, description="关联的已登记生产批次号列表；非空、不可重复，按提交顺序保存")

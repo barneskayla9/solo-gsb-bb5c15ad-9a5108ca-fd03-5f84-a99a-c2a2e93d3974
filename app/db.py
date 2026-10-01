@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS adjudication_version (
     disposition   TEXT NOT NULL,
     reasons       TEXT NOT NULL DEFAULT '[]',
     sources       TEXT NOT NULL DEFAULT '{}',
-    trigger       TEXT NOT NULL,                -- REGISTER / CORRECT_BATCH / CORRECT_LOT
+    trigger       TEXT NOT NULL,                -- REGISTER / CORRECT_BATCH / CORRECT_LOT / VOID_BATCH / MOVE_BATCH（line_id/seq 为该版裁决当时的归属，换线不改写历史）
     decided_at    TEXT NOT NULL
 );
 

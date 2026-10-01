@@ -10,6 +10,7 @@ from .errors import APIError
 from .schemas import (
     BatchCorrection,
     BatchIn,
+    BatchReassignIn,
     BatchVoidIn,
     CleaningCorrection,
     LotLockIn,
@@ -149,6 +150,18 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         未知批次 404、空原因 400，失败不留下部分版本。
         """
         return service.void_batch(batch_no, body.reason)
+
+    @app.post("/api/batches/{batch_no}/reassign", tags=["批次换线更正"])
+    def reassign_batch(batch_no: str, body: BatchReassignIn, service: Service = Depends(svc)):
+        """更正批次误归产线：凭有效批次号与另一条已登记产线编号移至目标线末尾。
+
+        批次号不变，获得目标线新顺序号，原线顺序号留空不复用；原线从移出位置起、
+        目标线从移入批次起按有效批次顺序重算过敏原残留与裁决，各追加历史裁决版本
+        （历史版本中的原产线与顺序号不改）；含这些批次的已确认核验单转待复核，
+        历次确认快照保持原样；直接用料未变，出货资格版本不递增。
+        未知批次/目标线、已作废批次、目标线与原线相同均整体拒绝，失败不留部分改动。
+        """
+        return service.reassign_batch(batch_no, body.target_line_id)
 
     @app.get("/api/batches/{batch_no}/history", tags=["批次"])
     def batch_history(batch_no: str, service: Service = Depends(svc)):

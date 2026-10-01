@@ -24,6 +24,15 @@
 **可查询，但重新核验与确认均拒绝**；作废批次不得更正。重复作废幂等返回既有结果且不重算；
 未知批次、空原因拒绝，失败不留下部分版本。
 
+生产批次**误归产线**时，可凭**有效批次号与另一条已登记产线编号**更正归属（换线）：
+该批移至目标产线**末尾**并获得目标线**新的顺序号**，**批次号不变**，原线原顺序号
+**留空而不复用**（其余批次顺序号不重排，新登记顺延下一号）。**原线从移出位置起、
+目标线从移入批次起**，按各自有效批次顺序**重算过敏原残留与裁决**；每个被重算批次
+（含移入批本身）**追加一个历史裁决版本**（trigger=`MOVE_BATCH`，即使结论不变也追加），
+**历史版本中的原产线与顺序号一律不改**。**直接用料未变，出货资格版本不因换线递增**；
+含这些批次的**已确认核验单转待复核**，历次确认快照保持原样。未知批次或目标线、
+已作废批次、目标线与原线相同均整体拒绝，失败不留下部分归属或裁决版本。
+
 - 技术栈：Python 3.11 + FastAPI + SQLite（标准库 `sqlite3`，WAL 模式）
 - 数据落盘：单个 SQLite 文件，Docker 卷持久化
 - 一键启动：`docker compose up`（首次启动自动建表、写入过敏原字典与演示原料批号）
@@ -91,6 +100,42 @@
 - **幂等与原子性**：重复作废返回既有结果（`changed=false`、首次原因、不重算）；
   未知批次 404、空白原因 400；整笔操作单事务，失败回滚，**不留下部分作废标记或部分版本**。
 
+### 生产批次误归产线更正（换线）
+
+生产批次误归产线时，可凭**有效批次号 + 另一条已登记产线编号**更正归属
+（`POST /api/batches/{batch_no}/reassign`，请求体 `{"target_line_id": "L2"}`）：
+
+- **批次号不变、移至目标线末尾**：批次只改归属产线与顺序号，目标线取“当前最大 seq + 1”；
+  用料 / 声明 / 清洁等登记内容一律不动。
+- **原线顺序号留空而不复用**：原线其余批次顺序号**不重排**（移出位置形成空洞），
+  其后新登记批次继续顺延下一号；目标线新顺序号正常顺延。
+- **两线各自按有效批次顺序重算**：
+  - 原线**从移出位置起**重算（被移批次不再参与原线残留链，其登记时的清洁也随之移出）；
+  - 目标线**从移入批次起**重算（移入批按目标线上一有效批的残留重新裁决，其后批次顺延）；
+  - 每个被重算批次（**含移入批本身**）追加一个历史裁决版本（trigger=`MOVE_BATCH`，
+    即使结论不变也追加）；移出点 / 移入点**之前**的批次不重算。
+- **历史版本中的原产线和顺序号不改**：历史裁决版本逐版记录当时的 `line_id` / `seq`，
+  换线前的版本保持原线旧序号，新版本记录目标线新序号（批次详情历史接口可查）。
+- **直接用料未变，出货资格版本不得因换线递增**：`shipment_eligibility.version` 不变、
+  资格历史不追加（批号锁定状态仍随直接用料关系保留，例如换线前 BLOCKED 的批次换线后
+  仍 BLOCKED、版本不变）；批号锁定历史同样不变。
+- **联动核验单**：含任一被重算批次（含移入批）的**已确认**核验单立即转**待复核**，
+  草稿/待复核单据不转态；**历次确认快照只追加保留、一律不改**。重新核验后逐批快照
+  刷新为新归属下的当前裁决/资格版本，方可再次确认。
+- **拒绝与原子性**：未知批次 404、未知（未登记）目标线 404、已作废批次 409、
+  目标线与原线相同 409、空白目标线 400；整笔操作单事务，失败回滚，
+  **不留下部分归属或部分裁决版本**。
+
+换线相关拒绝码：
+
+| 场景 | HTTP | error.code |
+| --- | --- | --- |
+| 更正归属的批次不存在 | 404 | `BATCH_NOT_FOUND` |
+| 目标产线未登记 | 404 | `LINE_NOT_FOUND` |
+| 更正已作废批次的归属 | 409 | `BATCH_VOIDED` |
+| 目标线与原产线相同 | 409 | `SAME_SOURCE_TARGET_LINE` |
+| `target_line_id` 为空/纯空白或缺字段 | 400/422 | `INVALID_PAYLOAD` / FastAPI 校验 |
+
 拒绝规则（失败时整个请求回滚，**不留下部分改动**）：
 
 | 场景 | HTTP | error.code |
@@ -148,7 +193,7 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 76 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、旧库升级
+python -m pytest -q            # 102 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、旧库升级
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
@@ -165,6 +210,10 @@ BASE_URL=http://127.0.0.1:8080 python examples/lot_lock_demo.py
 # 误登记批次作废端到端示例（作废保留/号不可复用/退出残留链重算/核验单联动/拒绝/幂等/查询标记）
 python examples/batch_void_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
+
+# 误归产线更正（换线）端到端示例（两线重算/原线留空/历史产线序号不改/资格版本不递增/核验单联动）
+python examples/batch_reassign_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
 ```
 
 ---
@@ -239,7 +288,8 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
 | PUT | `/api/batches/{batch_no}` | **更正批次**（用料/声明/清洁，任一可选），重算本批及后续批次 |
 | PUT | `/api/batches/{batch_no}/cleaning` | 专用：仅更正开工前清洁核验确认清除的过敏原 |
 | POST | `/api/batches/{batch_no}/void` | **作废误登记批次**，请求体 `{"reason": "..."}`（必填非空）；保留可查、号不可复用，其后有效批次按序重算，已确认核验单转待复核；重复作废幂等 |
-| GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间），作废批次标明状态 |
+| POST | `/api/batches/{batch_no}/reassign` | **更正误归产线（换线）**，请求体 `{"target_line_id": "L2"}`（须为另一条已登记产线）；批次移至目标线末尾获新顺序号，原线序号留空，两线按序重算追加 `MOVE_BATCH` 版本，已确认核验单转待复核；直接用料不变、出货资格版本不递增 |
+| GET | `/api/batches/{batch_no}/history` | 查询该批**历史裁决版本**（只追加，含触发原因与时间；逐版记录当时产线与顺序号），作废批次标明状态 |
 
 ### 批次作废
 
@@ -275,6 +325,44 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
 要点：作废保留原登记、历史裁决/资格与原因供查询，**批次号不可复用**；作废批次退出同线
 残留链（其清洁视为未发生），不再参与当前资格统计、批号锁定联动与新核验；作废批次不得更正；
 含作废批次的已有单据可查询但重新核验/确认均拒绝；历次确认快照不改。
+
+### 误归产线更正（换线）
+
+误归产线的有效批次可凭目标产线编号更正归属
+（`POST /api/batches/{batch_no}/reassign`，请求体 `{"target_line_id": "L2"}`）。响应给出
+批次新旧归属、原线/目标线两线重算结果及受影响核验单：
+
+```jsonc
+{
+  "moved": { /* 更正后的完整批次记录：line_id=L2、seq=2，批次号与用料/声明/清洁不变 */ },
+  "assignment": {
+    "batch_no": "B2026002",
+    "from_line_id": "L1",
+    "from_seq": 2,          // 原线顺序号：留空不复用
+    "to_line_id": "L2",
+    "to_seq": 2             // 目标线末尾新顺序号
+  },
+  "source_line": {
+    "line_id": "L1",
+    "vacated_seq": 2,       // 原线留空的顺序号
+    "recomputed": [ /* 原线从移出位置起重算的批次裁决摘要（trigger=MOVE_BATCH） */ ]
+  },
+  "target_line": {
+    "line_id": "L2",
+    "recomputed": [ /* 目标线从移入批次起重算的摘要，含移入批本身 */ ]
+  },
+  "recomputed": [ /* 两线重算摘要的合并列表（原线在前、目标线在后） */ ],
+  "affected_verifications": [ /* 含被重算批次的核验单（CONFIRMED 已转 PENDING_REVIEW） */
+    { "verification_no": "SH-001", "status": "PENDING_REVIEW", "updated_at": "..." }
+  ]
+}
+```
+
+要点：批次号不变；原线顺序号留空不复用、其余批次不重排；两线按各自有效批次顺序重算，
+被重算批次各追加一个历史裁决版本，**历史版本中的原产线与顺序号不改**
+（历史接口逐版返回 `line_id` / `seq`）；直接用料未变，**出货资格版本不递增**、
+资格历史不追加；已确认核验单转待复核，历次确认快照保持原样；未知批次/目标线、已作废批次、
+目标线与原线相同整体拒绝，失败不留下部分归属或裁决版本。
 
 ### 出货资格
 
@@ -510,6 +598,16 @@ curl -s http://127.0.0.1:8080/api/batches/B002/history
 curl -s -X POST http://127.0.0.1:8080/api/batches/B002/void \
   -H 'Content-Type: application/json' \
   -d '{"reason":"再次提交作废"}'
+
+# 20) 批次误归产线更正：凭有效批次号与另一条已登记产线编号移至目标线末尾
+#     （批次号不变、原线序号留空、两线按序重算追加 MOVE_BATCH 版本；
+#      直接用料不变，出货资格版本不递增；已确认核验单转待复核）
+curl -s -X POST http://127.0.0.1:8080/api/batches/B003/reassign \
+  -H 'Content-Type: application/json' \
+  -d '{"target_line_id":"L2"}'
+
+# 21) 查询历史裁决版本：v1 保留原产线/顺序号，v2 为换线后（MOVE_BATCH）
+curl -s http://127.0.0.1:8080/api/batches/B003/history
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -520,7 +618,11 @@ curl -s -X POST http://127.0.0.1:8080/api/batches/B002/void \
 （锁定 → 出货资格版本递增 → 残留不连带 → 确认拦截 → 待复核 → 解除 → 重新核验 → 二次确认）；
 误登记批次作废全流程示例见 [`examples/batch_void_demo.py`](examples/batch_void_demo.py)
 （作废保留 → 号不可复用/不得更正 → 退出残留链按序重算 → 已确认单据转待复核 →
-含作废批次单据拒绝重新核验/确认 → 重复作废幂等 → 查询标明状态）。
+含作废批次单据拒绝重新核验/确认 → 重复作废幂等 → 查询标明状态）；
+误归产线更正（换线）全流程示例见 [`examples/batch_reassign_demo.py`](examples/batch_reassign_demo.py)
+（拒绝场景 → 换线新旧归属/原线留空 → 两线重算与历史版本产线序号不改 →
+出货资格版本不递增 → 已确认单据转待复核且确认快照原样 → 顺序号不复用 →
+重新核验后二次确认与历史快照保留）。
 示例脚本可重复调用其中的“登记原料批号”接口（重复时自动跳过）；批次号固定，
 重复运行前如需重置可 `docker compose down -v` 后重新启动，或删除本地 `data/` 目录。
 
@@ -543,10 +645,12 @@ curl -s -X POST http://127.0.0.1:8080/api/batches/B002/void \
 ├── examples/verification_demo.py # 出货核验单端到端调用示例
 ├── examples/lot_lock_demo.py     # 原料批号待检锁定/出货资格端到端调用示例
 ├── examples/batch_void_demo.py   # 误登记批次作废端到端调用示例
+├── examples/batch_reassign_demo.py # 误归产线更正（换线）端到端调用示例
 ├── tests/test_service.py         # pytest 测试（裁决/更正/历史，20 项）
 ├── tests/test_verification.py    # pytest 测试（出货核验单，15 项）
 ├── tests/test_lot_lock.py        # pytest 测试（批号锁定/出货资格/旧库升级，18 项）
 ├── tests/test_batch_void.py      # pytest 测试（批次作废/重算联动/核验单拒绝/旧库升级，23 项）
+├── tests/test_batch_reassign.py  # pytest 测试（误归产线换线/两线重算/历史归属/资格不递增/核验单联动/原子性，26 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -559,7 +663,8 @@ curl -s -X POST http://127.0.0.1:8080/api/batches/B002/void \
 - `line` / `batch` / `batch_material`：产线、批次（含 `line_id+seq` 唯一顺序、
   `status`/`voided_reason`/`voided_at` 作废标记）、批次用料关联
 - `adjudication`：每批当前裁决快照（作废后冻结保留，不再更新）
-- `adjudication_version`：只追加的历史裁决版本（`REGISTER` / `CORRECT_BATCH` / `CORRECT_LOT` / `VOID_BATCH`）
+- `adjudication_version`：只追加的历史裁决版本（`REGISTER` / `CORRECT_BATCH` / `CORRECT_LOT` /
+  `VOID_BATCH` / `MOVE_BATCH`；每版记录裁决当时的 `line_id` / `seq`，换线不改写历史版本）
 - `material_lot_lock` / `material_lot_lock_version`：原料批号当前待检锁定状态与只追加的
   锁定/解除历史（`LOCK` / `UNLOCK`）
 - `shipment_eligibility` / `shipment_eligibility_version`：每批当前出货资格与只追加历史
