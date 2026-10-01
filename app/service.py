@@ -998,6 +998,93 @@ class Service:
             "affected_verifications": affected,
         }
 
+    def transfer_batch(self, batch_no: str, target_line_id: str) -> dict[str, Any]:
+        """更正批次产线归属：凭有效批次号与另一条已登记产线编号换线。
+
+        - 该批移至目标产线末尾，获得目标线新的顺序号；原线顺序号留空而不复用；
+        - 原线从移出位置起、目标线从移入批次起，按各自有效批次顺序重算残留与裁决，
+          被重算批次各追加一个历史裁决版本；历史版本中的原产线与顺序号不改；
+        - 直接用料未变，出货资格版本不因换线递增；
+        - 含被重算批次的已确认核验单转待复核，历次确认快照保持原样；
+        - 未知批次/目标线 404、已作废批次 409、目标线与原线相同 409；
+          失败整体回滚，不留下部分归属或裁决版本。
+        """
+        batch_no = (batch_no or "").strip()
+        target_line_id = (target_line_id or "").strip()
+        if not batch_no:
+            raise bad_request("INVALID_PAYLOAD", "batch_no 不能为空")
+        if not target_line_id:
+            raise bad_request(
+                "INVALID_PAYLOAD", "target_line_id 不能为空：须指定另一条已登记产线"
+            )
+        with self.store.write() as conn:
+            row = conn.execute(
+                "SELECT * FROM batch WHERE batch_no = ?", (batch_no,)
+            ).fetchone()
+            if not row:
+                raise not_found("BATCH_NOT_FOUND", f"批次不存在: {batch_no}")
+            if row["status"] == "VOIDED":
+                raise conflict(
+                    "BATCH_VOIDED",
+                    f"批次已作废，不可更正产线归属: {batch_no}（作废保留可查，批次号不可复用）",
+                )
+            source_line_id = row["line_id"]
+            source_seq = row["seq"]
+            if target_line_id == source_line_id:
+                raise conflict(
+                    "SAME_LINE_TRANSFER",
+                    f"目标产线与原产线相同: {target_line_id}，归属未变化，拒绝换线",
+                )
+            if not conn.execute(
+                "SELECT 1 FROM line WHERE line_id = ?", (target_line_id,)
+            ).fetchone():
+                raise not_found(
+                    "LINE_NOT_FOUND", f"目标产线未登记: {target_line_id}"
+                )
+
+            # 目标线末尾新顺序号（与登记一致：作废批次占用的 seq 同样不复用）
+            new_seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM batch WHERE line_id = ?",
+                (target_line_id,),
+            ).fetchone()["max_seq"] + 1
+
+            conn.execute(
+                "UPDATE batch SET line_id=?, seq=? WHERE batch_no=?",
+                (target_line_id, new_seq, batch_no),
+            )
+
+            # 原线：从移出位置起重算（该批已移走，实际重算原位置之后的有效批次）；
+            # 目标线：从移入批次起重算（该批在末尾，携带目标线既有残留重新裁决）。
+            recomputed_origin = recompute_from(
+                conn, source_line_id, source_seq, "TRANSFER_LINE"
+            )
+            recomputed_target = recompute_from(
+                conn, target_line_id, new_seq, "TRANSFER_LINE"
+            )
+
+            # 直接用料未变：不触碰出货资格（版本不因换线递增）。
+            # 被重算批次（含转移批次本身）涉及的已确认核验单已转待复核。
+            affected = _affected_verifications(
+                conn,
+                sorted(
+                    {s["batch_no"] for s in recomputed_origin + recomputed_target}
+                ),
+            )
+            full = _batch_full(
+                conn,
+                conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone(),
+            )
+
+        return {
+            "transferred": full,
+            "batch_no": batch_no,
+            "from": {"line_id": source_line_id, "seq": source_seq},
+            "to": {"line_id": target_line_id, "seq": new_seq},
+            "recomputed_origin": recomputed_origin,
+            "recomputed_target": recomputed_target,
+            "affected_verifications": affected,
+        }
+
     def batch_history(self, batch_no: str) -> dict[str, Any]:
         with self.store.read() as conn:
             row = conn.execute("SELECT * FROM batch WHERE batch_no = ?", (batch_no,)).fetchone()
@@ -1018,6 +1105,8 @@ class Service:
                 "history": [
                     {
                         "version": v["version"],
+                        "line_id": v["line_id"],
+                        "seq": v["seq"],
                         "actual_allergens": loads(v["actual"]),
                         "undeclared_allergens": loads(v["undeclared"]),
                         "disposition": v["disposition"],
@@ -1419,6 +1508,7 @@ _TRIGGER_LABELS = {
     "CORRECT_BATCH": "批次更正重算",
     "CORRECT_LOT": "原料批号更正重算",
     "VOID_BATCH": "同线批次作废后按序重算",
+    "TRANSFER_LINE": "批次产线归属更正重算",
     "LOT_LOCK": "原料批号待检锁定",
     "LOT_UNLOCK": "原料批号解除待检锁定",
     "UPGRADE_INIT": "旧库升级初始资格",
